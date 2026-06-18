@@ -6755,6 +6755,78 @@ def extract_rust(path: Path) -> dict:
                 if tgt != func_nid:
                     add_edge(func_nid, tgt, "references", line, context=ctx)
 
+    seen_import_edges: set[tuple[str, str, int]] = set()
+
+    def node_text(node) -> str:
+        return _read_text(node, source)
+
+    def rust_use_paths(node, prefix: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
+        if node.type == "identifier":
+            return [prefix + (node_text(node),)]
+
+        if node.type in ("crate", "super"):
+            return [prefix + (node.type,)]
+
+        if node.type == "self":
+            return [prefix]
+
+        if node.type == "scoped_identifier":
+            path = node.child_by_field_name("path")
+            name = node.child_by_field_name("name")
+            prefixes = rust_use_paths(path, prefix) if path else [prefix]
+            if not name:
+                return prefixes
+            return [current_prefix + (node_text(name),) for current_prefix in prefixes]
+
+        if node.type == "scoped_use_list":
+            path = node.child_by_field_name("path")
+            use_list = node.child_by_field_name("list")
+            prefixes = rust_use_paths(path, prefix) if path else [prefix]
+            if not use_list:
+                return prefixes
+            paths: list[tuple[str, ...]] = []
+            for current_prefix in prefixes:
+                paths.extend(rust_use_paths(use_list, current_prefix))
+            return paths
+
+        if node.type == "use_list":
+            paths: list[tuple[str, ...]] = []
+            for child in node.named_children:
+                paths.extend(rust_use_paths(child, prefix))
+            return paths
+
+        if node.type == "use_as_clause":
+            path = node.child_by_field_name("path") or (
+                node.named_children[0] if node.named_children else None
+            )
+            return rust_use_paths(path, prefix) if path else []
+
+        paths: list[tuple[str, ...]] = []
+        for child in node.named_children:
+            paths.extend(rust_use_paths(child, prefix))
+        return paths
+
+    def rust_target_ids(parts: tuple[str, ...]) -> set[str]:
+        segments = [part for part in parts if part not in {"crate", "super", "self"}]
+        if not segments:
+            return set()
+
+        ids = {_make_id(segments[-1])}
+        if len(segments) >= 2:
+            ids.add(_make_id(segments[-2]))
+            ids.add(_make_id(segments[-2], segments[-1]))
+        if len(segments) >= 3:
+            ids.add(_make_id(*segments[-3:]))
+        return ids
+
+    def add_rust_import_edges(target_ids: set[str], line: int) -> None:
+        for target_id in sorted(target_ids):
+            edge_key = (file_nid, target_id, line)
+            if edge_key in seen_import_edges:
+                continue
+            seen_import_edges.add(edge_key)
+            add_edge(file_nid, target_id, "imports_from", line, context="import")
+
     def walk(node, parent_impl_nid: str | None = None) -> None:
         t = node.type
 
@@ -6855,15 +6927,21 @@ def extract_rust(path: Path) -> dict:
                     walk(child, parent_impl_nid=impl_nid)
             return
 
+        if t == "mod_item":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                module_name = node_text(name_node).strip()
+                if module_name:
+                    add_rust_import_edges({_make_id(module_name)}, node.start_point[0] + 1)
+            return
+
         if t == "use_declaration":
             arg = node.child_by_field_name("argument")
             if arg:
-                raw = _read_text(arg, source)
-                clean = raw.split("{")[0].rstrip(":").rstrip("*").rstrip(":")
-                module_name = clean.split("::")[-1].strip()
-                if module_name:
-                    tgt_nid = _make_id(module_name)
-                    add_edge(file_nid, tgt_nid, "imports_from", node.start_point[0] + 1, context="import")
+                target_ids: set[str] = set()
+                for use_path in rust_use_paths(arg):
+                    target_ids.update(rust_target_ids(use_path))
+                add_rust_import_edges(target_ids, node.start_point[0] + 1)
             return
 
         for child in node.children:
