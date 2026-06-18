@@ -3,7 +3,14 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 import pytest
-from graphify.extract import extract_js, extract_go, extract_rust, extract, extract_sql
+from graphify.extract import (
+    _make_id,
+    extract,
+    extract_go,
+    extract_js,
+    extract_rust,
+    extract_sql,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -22,6 +29,9 @@ def _call_pairs(result):
 
 def _confidences(result):
     return {e["confidence"] for e in result["edges"]}
+
+def _import_targets(result):
+    return {e["target"] for e in result["edges"] if e["relation"] == "imports_from"}
 
 
 def _edges_with_relation(result, *relations):
@@ -334,6 +344,35 @@ def test_rust_no_dangling_edges():
     for e in r["edges"]:
         if e["relation"] in ("contains", "method", "calls"):
             assert e["source"] in node_ids
+
+def test_rust_finds_mod_declarations(tmp_path):
+    src = tmp_path / "mod.rs"
+    src.write_text("pub mod accounts;\nmod storage;\n")
+
+    r = extract_rust(src)
+
+    targets = _import_targets(r)
+    assert _make_id("accounts") in targets
+    assert _make_id("storage") in targets
+
+def test_rust_use_targets_module_and_item_candidates(tmp_path):
+    src = tmp_path / "consumer.rs"
+    src.write_text(
+        "\n".join([
+            "use crate::projector::accounts::AccountProjector;",
+            "use super::{balances::BalanceProjector, positions};",
+            "",
+        ])
+    )
+
+    r = extract_rust(src)
+
+    targets = _import_targets(r)
+    assert _make_id("accounts") in targets
+    assert _make_id("accounts", "AccountProjector") in targets
+    assert _make_id("balances") in targets
+    assert _make_id("balances", "BalanceProjector") in targets
+    assert _make_id("positions") in targets
 
 
 def test_rust_trait_impl_emits_implements():
